@@ -105,6 +105,58 @@ function sendJson(res, statusCode, data) {
   res.end(JSON.stringify(data));
 }
 
+// ── Phone Normalization & Matching Helpers ─────────────────────────
+function getCanonicalPhone(raw) {
+  if (!raw) return '';
+  let s = raw.toString().replace(/[\s\-\(\)\.]/g, '');
+  let digits = s.replace(/\D/g, '');
+  if (digits.startsWith('0') && digits.length > 10) {
+    digits = digits.slice(1);
+  }
+  return digits;
+}
+
+function phonesMatch(phoneA, phoneB) {
+  const a = getCanonicalPhone(phoneA);
+  const b = getCanonicalPhone(phoneB);
+  if (!a || !b) return false;
+  if (a === b) return true;
+  if (a.length >= 10 && b.length >= 10) {
+    return a.slice(-10) === b.slice(-10);
+  }
+  return a.endsWith(b) || b.endsWith(a);
+}
+
+function popPendingDeliveries(phone) {
+  const result = [];
+  const keysToDelete = [];
+  for (const [key, list] of pendingDeliveries.entries()) {
+    if (phonesMatch(key, phone)) {
+      result.push(...list);
+      keysToDelete.push(key);
+    }
+  }
+  for (const k of keysToDelete) {
+    pendingDeliveries.delete(k);
+  }
+  return result;
+}
+
+function popStatusAcks(phone) {
+  const result = [];
+  const keysToDelete = [];
+  for (const [key, list] of statusAcks.entries()) {
+    if (phonesMatch(key, phone)) {
+      result.push(...list);
+      keysToDelete.push(key);
+    }
+  }
+  for (const k of keysToDelete) {
+    statusAcks.delete(k);
+  }
+  return result;
+}
+
 // HTTP Server
 const server = http.createServer(async (req, res) => {
   // Handle CORS preflight
@@ -312,8 +364,8 @@ const server = http.createServer(async (req, res) => {
     // ── 8. Real-Time Message Relay: Send Message ─────────────────
     if (req.method === 'POST' && pathname === '/api/messages/send') {
       const body = await parseJson(req);
-      const senderPhone = (body.senderPhone || '').replace(/[^0-9+]/g, '');
-      const recipientPhone = (body.recipientPhone || '').replace(/[^0-9+]/g, '');
+      const senderPhone = (body.senderPhone || '').toString().trim();
+      const recipientPhone = (body.recipientPhone || '').toString().trim();
       const senderName = (body.senderName || 'Chatter User').trim();
       const text = body.text || '';
       const mediaType = body.mediaType || 'text';
@@ -339,19 +391,21 @@ const server = http.createServer(async (req, res) => {
         status: 'delivered',
       };
 
-      // Queue for recipient phone
-      if (!pendingDeliveries.has(recipientPhone)) {
-        pendingDeliveries.set(recipientPhone, []);
+      // Queue for recipient using canonical phone key
+      const recipientKey = getCanonicalPhone(recipientPhone);
+      if (!pendingDeliveries.has(recipientKey)) {
+        pendingDeliveries.set(recipientKey, []);
       }
-      pendingDeliveries.get(recipientPhone).push(msg);
+      pendingDeliveries.get(recipientKey).push(msg);
 
       // Instantly mark delivered to sender
-      if (!statusAcks.has(senderPhone)) {
-        statusAcks.set(senderPhone, []);
+      const senderKey = getCanonicalPhone(senderPhone);
+      if (!statusAcks.has(senderKey)) {
+        statusAcks.set(senderKey, []);
       }
-      statusAcks.get(senderPhone).push({ id: msgId, status: 'delivered' });
+      statusAcks.get(senderKey).push({ id: msgId, status: 'delivered' });
 
-      console.log(`\n📨 [REAL-TIME RELAY] ${senderPhone} (${senderName}) ➔ ${recipientPhone}: "${text}"`);
+      console.log(`\n📨 [RELAY SEND] From: ${senderPhone} (${senderName}) ➔ To: ${recipientPhone} [Canonical: ${recipientKey}]: "${text}"`);
 
       return sendJson(res, 200, {
         success: true,
@@ -362,25 +416,27 @@ const server = http.createServer(async (req, res) => {
 
     // ── 9. Real-Time Message Relay: Poll Incoming Messages ───────
     if (req.method === 'GET' && pathname === '/api/messages/poll') {
-      const rawPhone = parsedUrl.query.phone || '';
-      const cleanPhone = rawPhone.replace(/[^0-9+]/g, '');
+      const rawPhone = (parsedUrl.query.phone || '').toString().trim();
+      const cleanPhone = rawPhone.replace(/\s+/g, '');
 
       if (!cleanPhone) {
         return sendJson(res, 400, { success: false, error: 'phone query parameter required' });
       }
 
       // Heartbeat: update user presence
-      if (users.has(cleanPhone)) {
-        const u = users.get(cleanPhone);
-        u.isOnline = true;
-        u.lastSeen = new Date().toISOString();
+      for (const [key, u] of users.entries()) {
+        if (phonesMatch(key, cleanPhone)) {
+          u.isOnline = true;
+          u.lastSeen = new Date().toISOString();
+        }
       }
 
-      const newMsgs = pendingDeliveries.get(cleanPhone) || [];
-      pendingDeliveries.delete(cleanPhone);
+      const newMsgs = popPendingDeliveries(cleanPhone);
+      const acks = popStatusAcks(cleanPhone);
 
-      const acks = statusAcks.get(cleanPhone) || [];
-      statusAcks.delete(cleanPhone);
+      if (newMsgs.length > 0 || acks.length > 0) {
+        console.log(`📥 [RELAY POLL] Phone: "${cleanPhone}" (Canonical: ${getCanonicalPhone(cleanPhone)}) ➔ Delivering ${newMsgs.length} messages, ${acks.length} acks`);
+      }
 
       return sendJson(res, 200, {
         success: true,
@@ -393,15 +449,16 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && pathname === '/api/messages/ack') {
       const body = await parseJson(req);
       const messageId = body.messageId || '';
-      const senderPhone = (body.senderPhone || '').replace(/[^0-9+]/g, '');
-      const recipientPhone = (body.recipientPhone || '').replace(/[^0-9+]/g, '');
+      const senderPhone = (body.senderPhone || '').toString().trim();
+      const recipientPhone = (body.recipientPhone || '').toString().trim();
       const status = body.status || 'read';
 
       if (senderPhone && messageId) {
-        if (!statusAcks.has(senderPhone)) {
-          statusAcks.set(senderPhone, []);
+        const senderKey = getCanonicalPhone(senderPhone);
+        if (!statusAcks.has(senderKey)) {
+          statusAcks.set(senderKey, []);
         }
-        statusAcks.get(senderPhone).push({ id: messageId, status });
+        statusAcks.get(senderKey).push({ id: messageId, status });
         console.log(`👁️ [SEEN / READ] Message ${messageId} marked READ by ${recipientPhone} ➔ Notified ${senderPhone} (RED TICKS)`);
       }
 
