@@ -1,0 +1,21 @@
+{
+  "name": "chatter-server",
+  "version": "1.0.0",
+  "description": "Chatter Real-Time E2EE Online Gateway & OTP Backend",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "chatter",
+    "e2ee",
+    "messaging",
+    "otp",
+    "render"
+  ],
+  "author": "Sravan",
+  "license": "MIT"
+}
