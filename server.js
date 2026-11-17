@@ -5,6 +5,7 @@
  */
 
 const http = require('http');
+const https = require('https');
 const crypto = require('crypto');
 const url = require('url');
 
@@ -157,6 +158,189 @@ function popStatusAcks(phone) {
   return result;
 }
 
+// ── Real SMS Dispatch Engine ───────────────────────────────────────
+async function dispatchRealSms(phone, otpCode) {
+  const cleanPhone = phone.replace(/[^0-9+]/g, '');
+  const digitsOnly = cleanPhone.replace(/\D/g, '');
+  const isIndia = cleanPhone.startsWith('+91') || (digitsOnly.length === 10);
+  const tenDigit = digitsOnly.slice(-10);
+
+  console.log('\n╔════════════════════════════════════════════════════════════════╗');
+  console.log('║               REAL SMS DISPATCH GATEWAY REQUEST                ║');
+  console.log('╠════════════════════════════════════════════════════════════════╣');
+  console.log(`║ Destination: ${cleanPhone.padEnd(49)} ║`);
+  console.log(`║ OTP Code:    ${otpCode.padEnd(49)} ║`);
+  console.log(`║ Timestamp:   ${new Date().toISOString().padEnd(49)} ║`);
+
+  // 1. Fast2SMS (Industry Standard for India +91)
+  const fast2SmsKey = process.env.FAST2SMS_API_KEY;
+  if (fast2SmsKey && isIndia) {
+    try {
+      console.log(`║ Gateway:     Fast2SMS (Sending to +91-${tenDigit})...`.padEnd(65) + '║');
+      const payload = JSON.stringify({
+        route: 'otp',
+        variables_values: otpCode,
+        numbers: tenDigit,
+      });
+
+      const res = await new Promise((resolve, reject) => {
+        const req = https.request({
+          hostname: 'www.fast2sms.com',
+          port: 443,
+          path: '/dev/bulkV2',
+          method: 'POST',
+          headers: {
+            'authorization': fast2SmsKey.trim(),
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(payload),
+          },
+          timeout: 10000,
+        }, (response) => {
+          let data = '';
+          response.on('data', chunk => data += chunk);
+          response.on('end', () => {
+            try {
+              resolve({ statusCode: response.statusCode, body: JSON.parse(data) });
+            } catch (_) {
+              resolve({ statusCode: response.statusCode, body: data });
+            }
+          });
+        });
+        req.on('error', reject);
+        req.on('timeout', () => {
+          req.destroy();
+          reject(new Error('Fast2SMS request timeout'));
+        });
+        req.write(payload);
+        req.end();
+      });
+
+      console.log(`║ Fast2SMS Response: ${JSON.stringify(res.body).substring(0, 42).padEnd(42)} ║`);
+      console.log('╚════════════════════════════════════════════════════════════════╝\n');
+      return { success: true, gateway: 'Fast2SMS', details: res };
+    } catch (err) {
+      console.error(`[Fast2SMS Error] ${err.message}`);
+    }
+  }
+
+  // 2. Twilio (Global / International Standard)
+  const twilioSid = process.env.TWILIO_ACCOUNT_SID;
+  const twilioAuth = process.env.TWILIO_AUTH_TOKEN;
+  const twilioFrom = process.env.TWILIO_PHONE_NUMBER || process.env.TWILIO_FROM;
+
+  if (twilioSid && twilioAuth && twilioFrom) {
+    try {
+      console.log(`║ Gateway:     Twilio (Sending to ${cleanPhone})...`.padEnd(65) + '║');
+      const postData = new URLSearchParams({
+        To: cleanPhone.startsWith('+') ? cleanPhone : `+${cleanPhone}`,
+        From: twilioFrom.trim(),
+        Body: `<Chatter> Your verification code is ${otpCode}. Valid for 5 minutes. Do not share this code.`,
+      }).toString();
+
+      const authHeader = 'Basic ' + Buffer.from(`${twilioSid.trim()}:${twilioAuth.trim()}`).toString('base64');
+
+      const res = await new Promise((resolve, reject) => {
+        const req = https.request({
+          hostname: 'api.twilio.com',
+          port: 443,
+          path: `/2010-04-01/Accounts/${twilioSid.trim()}/Messages.json`,
+          method: 'POST',
+          headers: {
+            'Authorization': authHeader,
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Content-Length': Buffer.byteLength(postData),
+          },
+          timeout: 10000,
+        }, (response) => {
+          let data = '';
+          response.on('data', chunk => data += chunk);
+          response.on('end', () => {
+            try {
+              resolve({ statusCode: response.statusCode, body: JSON.parse(data) });
+            } catch (_) {
+              resolve({ statusCode: response.statusCode, body: data });
+            }
+          });
+        });
+        req.on('error', reject);
+        req.on('timeout', () => {
+          req.destroy();
+          reject(new Error('Twilio request timeout'));
+        });
+        req.write(postData);
+        req.end();
+      });
+
+      console.log(`║ Twilio Response: ${JSON.stringify(res.body).substring(0, 44).padEnd(44)} ║`);
+      console.log('╚════════════════════════════════════════════════════════════════╝\n');
+      return { success: true, gateway: 'Twilio', details: res };
+    } catch (err) {
+      console.error(`[Twilio Error] ${err.message}`);
+    }
+  }
+
+  // 3. Custom Webhook SMS Gateway
+  const webhookUrl = process.env.SMS_GATEWAY_URL;
+  if (webhookUrl) {
+    try {
+      console.log(`║ Gateway:     Custom Webhook URL...`.padEnd(65) + '║');
+      const targetUrl = new URL(webhookUrl);
+      const isHttps = targetUrl.protocol === 'https:';
+      const transport = isHttps ? https : http;
+      const payload = JSON.stringify({
+        to: cleanPhone,
+        phone: cleanPhone,
+        otp: otpCode,
+        message: `<Chatter> Your verification code is ${otpCode}. Valid for 5 minutes.`,
+      });
+
+      const headers = {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload),
+      };
+      if (process.env.SMS_GATEWAY_KEY) {
+        headers['Authorization'] = `Bearer ${process.env.SMS_GATEWAY_KEY.trim()}`;
+      }
+
+      const res = await new Promise((resolve, reject) => {
+        const req = transport.request({
+          hostname: targetUrl.hostname,
+          port: targetUrl.port || (isHttps ? 443 : 80),
+          path: targetUrl.pathname + targetUrl.search,
+          method: 'POST',
+          headers,
+          timeout: 10000,
+        }, (response) => {
+          let data = '';
+          response.on('data', chunk => data += chunk);
+          response.on('end', () => resolve({ statusCode: response.statusCode, body: data }));
+        });
+        req.on('error', reject);
+        req.on('timeout', () => {
+          req.destroy();
+          reject(new Error('Custom gateway timeout'));
+        });
+        req.write(payload);
+        req.end();
+      });
+
+      console.log(`║ Custom Gateway: Status ${res.statusCode}`.padEnd(65) + '║');
+      console.log('╚════════════════════════════════════════════════════════════════╝\n');
+      return { success: true, gateway: 'CustomWebhook', details: res };
+    } catch (err) {
+      console.error(`[Custom Gateway Error] ${err.message}`);
+    }
+  }
+
+  // 4. Default / Simulated SMS (Logged securely in Render Web Service Logs)
+  console.log('║ Gateway:     Render Cloud Logs (Key not configured)           ║');
+  console.log('║ Note: To send live carrier SMS to user phone numbers:         ║');
+  console.log('║  • India: set FAST2SMS_API_KEY in Render Environment          ║');
+  console.log('║  • Global: set TWILIO_ACCOUNT_SID & TWILIO_AUTH_TOKEN         ║');
+  console.log('╚════════════════════════════════════════════════════════════════╝\n');
+  return { success: true, gateway: 'Console' };
+}
+
 // HTTP Server
 const server = http.createServer(async (req, res) => {
   // Handle CORS preflight
@@ -184,7 +368,7 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
-    // ── 2. Real-Time OTP: Send OTP ──────────────────────────────
+    // ── 2. Real-Time OTP: Send OTP (via Real SMS Gateway) ──────
     if (req.method === 'POST' && pathname === '/api/auth/send-otp') {
       const body = await parseJson(req);
       const rawPhone = body.phone || '';
@@ -207,21 +391,23 @@ const server = http.createServer(async (req, res) => {
         attempts: 0,
       });
 
-      // Console SMS Dispatch
-      console.log('\n==================================================');
-      console.log(`📱 [REAL-TIME SMS GATEWAY DISPATCH]`);
-      console.log(`To: ${cleanPhone}`);
-      console.log(`Message: <Chatter> Your verification code is ${otpCode}. Valid for 5 minutes.`);
-      console.log(`Timestamp: ${new Date().toLocaleTimeString()}`);
-      console.log('==================================================\n');
+      // Dispatch real SMS to registered mobile carrier via SMS Gateway
+      const smsResult = await dispatchRealSms(cleanPhone, otpCode);
 
-      return sendJson(res, 200, {
+      const resp = {
         success: true,
-        message: `OTP sent successfully to ${cleanPhone}`,
+        message: `Verification code sent via SMS to ${cleanPhone}`,
         phone: cleanPhone,
-        otp: otpCode, // Provided for instant real-time filling
+        gateway: smsResult.gateway,
         expiresInSeconds: 300,
-      });
+      };
+
+      // Only expose OTP in debug mode if explicitly enabled on server
+      if (process.env.EXPOSE_OTP === 'true') {
+        resp.otp = otpCode;
+      }
+
+      return sendJson(res, 200, resp);
     }
 
     // ── 3. Real-Time OTP: Verify OTP ────────────────────────────
@@ -232,59 +418,79 @@ const server = http.createServer(async (req, res) => {
       const enteredOtp = (body.otp || '').trim();
       const userName = (body.name || '').trim();
 
-      const storedOtp = activeOtps.get(cleanPhone);
+      // Find matching active OTP by phone
+      let matchedKey = null;
+      let storedOtp = null;
+      for (const [k, v] of activeOtps.entries()) {
+        if (phonesMatch(k, cleanPhone)) {
+          matchedKey = k;
+          storedOtp = v;
+          break;
+        }
+      }
 
       if (!storedOtp) {
         return sendJson(res, 400, {
           success: false,
-          error: 'No active OTP found for this number. Please request a new code.',
+          error: 'No active OTP found for this number. Please request a new SMS code.',
         });
       }
 
       if (Date.now() > storedOtp.expiresAt) {
-        activeOtps.delete(cleanPhone);
+        activeOtps.delete(matchedKey);
         return sendJson(res, 400, {
           success: false,
-          error: 'OTP has expired. Please request a new code.',
+          error: 'SMS verification code has expired. Please request a new code.',
         });
       }
 
-      storedOtp.attempts++;
+      storedOtp.attempts = (storedOtp.attempts || 0) + 1;
       if (storedOtp.attempts > 5) {
-        activeOtps.delete(cleanPhone);
+        activeOtps.delete(matchedKey);
         return sendJson(res, 429, {
           success: false,
-          error: 'Too many invalid attempts. Please request a new OTP.',
+          error: 'Too many invalid attempts. Please request a new verification code.',
         });
       }
 
       if (storedOtp.code !== enteredOtp) {
         return sendJson(res, 400, {
           success: false,
-          error: 'Incorrect 6-digit OTP code. Please check and try again.',
+          error: 'Incorrect 6-digit code. Please enter the exact code received in your SMS.',
         });
       }
 
       // Validated! Remove consumed OTP
-      activeOtps.delete(cleanPhone);
+      activeOtps.delete(matchedKey);
 
       // Create / update user session
-      let existingUser = users.get(cleanPhone);
+      let existingUser = null;
+      for (const [k, u] of users.entries()) {
+        if (phonesMatch(k, cleanPhone)) {
+          existingUser = u;
+          break;
+        }
+      }
+
       if (!existingUser) {
         const initials = userName.length > 0
             ? userName.split(' ').map(w => w[0]).join('').substring(0, 2).toUpperCase()
             : 'U';
         existingUser = {
           phone: cleanPhone,
-          name: userName.isNotEmpty ? userName : 'Chatter User',
+          name: userName.length > 0 ? userName : 'Chatter User',
           about: 'Hey there! I am using Chatter.',
           avatarLabel: initials,
           isOnline: true,
           lastSeen: new Date().toISOString(),
         };
         users.set(cleanPhone, existingUser);
-      } else if (userName.length > 0) {
-        existingUser.name = userName;
+      } else {
+        existingUser.isOnline = true;
+        existingUser.lastSeen = new Date().toISOString();
+        if (userName.length > 0) {
+          existingUser.name = userName;
+        }
       }
 
       const authToken = 'sc_' + crypto.randomBytes(24).toString('hex');

@@ -22,6 +22,30 @@ When deploying to [Render Dashboard](https://dashboard.render.com/web/new):
 
 ---
 
+## 📱 Real SMS Carrier Gateway Configuration
+
+To deliver live SMS verification codes directly to real mobile devices:
+
+### Option A: Fast2SMS (Recommended for India `+91`)
+1. Create a free account at [fast2sms.com](https://www.fast2sms.com/).
+2. Copy your **API Key** from the Fast2SMS Dev API dashboard.
+3. In your **Render Dashboard** ➔ Select your `chatter-server` service ➔ **Environment** tab.
+4. Add Environment Variable:
+   - **Key**: `FAST2SMS_API_KEY`
+   - **Value**: `your_fast2sms_api_key_here`
+5. Save changes. Render will auto-reload. All `+91` numbers will receive live carrier SMS immediately!
+
+### Option B: Twilio (Global Worldwide)
+1. Add the following in your **Render Environment** tab:
+   - `TWILIO_ACCOUNT_SID`: `ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx`
+   - `TWILIO_AUTH_TOKEN`: `your_auth_token`
+   - `TWILIO_PHONE_NUMBER`: `+1xxxxxxxxxx`
+2. Save changes. International carrier SMS will be dispatched globally!
+
+> **Note**: If no external SMS key is set, Chatter logs the dispatched SMS code securely in the **Render Web Service Logs** (`https://dashboard.render.com`) so you can test instantly.
+
+---
+
 ## 📲 Connecting Mobile App (Across Any Network)
 
 1. Open **Chatter** on any phone (on 4G/5G mobile data or Wi-Fi).
